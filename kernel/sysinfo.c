@@ -142,7 +142,22 @@ static int sysinfo_show(struct seq_file *m, void *v)
         seq_printf(m, "    {\n");
         seq_printf(m, "      \"PID\": %d,\n",      task->pid);
         seq_printf(m, "      \"Name\": \"%s\",\n", task->comm);
-        seq_printf(m, "      \"Cmdline\": \"%s\",\n", cmdline ? cmdline : "N/A");
+        // Imprimir cmdline escapando caracteres especiales
+        seq_printf(m, "      \"Cmdline\": \"");
+        if (cmdline) {
+            int ci;
+            for (ci = 0; cmdline[ci] != '\0'; ci++) {
+                if (cmdline[ci] == '"')
+                    seq_printf(m, "\\\"");
+                else if (cmdline[ci] == '\\')
+                    seq_printf(m, "\\\\");
+                else
+                    seq_printf(m, "%c", cmdline[ci]);
+            }
+        } else {
+            seq_printf(m, "N/A");
+        }
+        seq_printf(m, "\",\n");
         seq_printf(m, "      \"VSZ\": %lu,\n",     vsz);
         seq_printf(m, "      \"RSS\": %lu,\n",     rss);
         seq_printf(m, "      \"MemUsage\": \"%lu.%02lu\",\n",
