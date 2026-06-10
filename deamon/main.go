@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -70,6 +71,7 @@ func main() {
 	conectarValkey()
 	instalarCronjob()
 	cargarModuloKernel()
+	iniciarHTTPServer()
 
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
@@ -185,6 +187,9 @@ func loopPrincipal() {
 
 	// 5. Aplicar lógica de decisiones
 	gestionarContenedores(altos, bajos)
+
+	// Guardar Top 5 para Grafana
+	guardarTop5(contenedores)
 
 	log.Println("--- Iteración completada ---")
 }
@@ -367,6 +372,20 @@ func guardarMetricasRAM(info ProcInfo) {
 		Score:  float64(timestamp),
 		Member: key,
 	})
+	// Guardar valores numéricos directos para gráficas
+	rdb.ZAdd(ctx, "ts:usedram", redis.Z{
+		Score:  float64(timestamp),
+		Member: fmt.Sprintf("%d:%d", timestamp*1000, info.Usedram),
+	})
+	rdb.ZAdd(ctx, "ts:freeram", redis.Z{
+		Score:  float64(timestamp),
+		Member: fmt.Sprintf("%d:%d", timestamp*1000, info.Freeram),
+	})
+	rdb.Expire(ctx, "ts:usedram", 24*time.Hour)
+	rdb.Expire(ctx, "ts:freeram", 24*time.Hour)
+
+	// Guardar referencia al último snapshot
+	rdb.Set(ctx, "ram:latest", key, 24*time.Hour)
 
 	log.Printf("Métricas RAM guardadas — key: %s", key)
 }
@@ -403,7 +422,226 @@ func guardarLogEliminacion(c ContainerInfo) {
 	// Incrementar contador total de eliminados
 	rdb.Incr(ctx, "eliminados:total")
 
+	rdb.ZAdd(ctx, "ts:eliminados", redis.Z{
+		Score:  float64(timestamp),
+		Member: fmt.Sprintf("%d:1", timestamp),
+	})
+	rdb.Expire(ctx, "ts:eliminados", 24*time.Hour)
+
 	log.Printf("Log de eliminación guardado — key: %s", key)
+}
+
+func guardarTop5(contenedores []ContainerInfo) {
+	if len(contenedores) == 0 {
+		return
+	}
+
+	timestamp := time.Now().Unix()
+
+	// Ordenar por RSS para Top 5 RAM
+	porRAM := make([]ContainerInfo, len(contenedores))
+	copy(porRAM, contenedores)
+	sort.Slice(porRAM, func(i, j int) bool {
+		return porRAM[i].RSS > porRAM[j].RSS
+	})
+
+	// Ordenar por CPU para Top 5 CPU
+	porCPU := make([]ContainerInfo, len(contenedores))
+	copy(porCPU, contenedores)
+	sort.Slice(porCPU, func(i, j int) bool {
+		return porCPU[i].CPUUsage > porCPU[j].CPUUsage
+	})
+
+	// Limitar a 5
+	limiteRAM := 5
+	if len(porRAM) < 5 {
+		limiteRAM = len(porRAM)
+	}
+	limiteCPU := 5
+	if len(porCPU) < 5 {
+		limiteCPU = len(porCPU)
+	}
+
+	// Guardar Top 5 RAM
+	keyRAM := fmt.Sprintf("top5ram:%d", timestamp)
+	for i, c := range porRAM[:limiteRAM] {
+		rdb.HSet(ctx, keyRAM, fmt.Sprintf("rank%d", i+1),
+			fmt.Sprintf("%s|%s|%d", c.ID[:8], c.Name, c.RSS))
+	}
+	rdb.Expire(ctx, keyRAM, 24*time.Hour)
+	rdb.Set(ctx, "top5ram:latest", keyRAM, 24*time.Hour)
+
+	// Guardar Top 5 CPU
+	keyCPU := fmt.Sprintf("top5cpu:%d", timestamp)
+	for i, c := range porCPU[:limiteCPU] {
+		rdb.HSet(ctx, keyCPU, fmt.Sprintf("rank%d", i+1),
+			fmt.Sprintf("%s|%s|%.2f", c.ID[:8], c.Name, c.CPUUsage))
+	}
+	rdb.Expire(ctx, keyCPU, 24*time.Hour)
+	rdb.Set(ctx, "top5cpu:latest", keyCPU, 24*time.Hour)
+
+	log.Printf("Top 5 guardado — RAM key: %s | CPU key: %s", keyRAM, keyCPU)
+}
+
+func iniciarHTTPServer() {
+	http.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+
+		// Obtener últimos 20 valores de RAM
+		vals, err := rdb.ZRevRangeWithScores(ctx, "ts:usedram", 0, 19).Result()
+		if err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+
+		type DataPoint struct {
+			Time  float64 `json:"time"`
+			Value float64 `json:"value"`
+		}
+
+		var points []DataPoint
+		for _, v := range vals {
+			parts := strings.Split(v.Member.(string), ":")
+			if len(parts) == 2 {
+				val, _ := strconv.ParseFloat(parts[1], 64)
+				points = append(points, DataPoint{
+					Time:  v.Score,
+					Value: val,
+				})
+			}
+		}
+
+		json.NewEncoder(w).Encode(points)
+	})
+
+	http.HandleFunc("/ram", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+
+		vals, err := rdb.ZRangeWithScores(ctx, "ts:usedram", 0, -1).Result()
+		if err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+
+		type DataPoint struct {
+			Time  string  `json:"time"`
+			Value float64 `json:"value"`
+		}
+
+		var points []DataPoint
+		for _, v := range vals {
+			parts := strings.Split(v.Member.(string), ":")
+			if len(parts) == 2 {
+				val, _ := strconv.ParseFloat(parts[1], 64)
+				ts := time.Unix(int64(v.Score), 0)
+				points = append(points, DataPoint{
+					Time:  ts.UTC().Format(time.RFC3339),
+					Value: val,
+				})
+			}
+		}
+
+		json.NewEncoder(w).Encode(points)
+	})
+
+	http.HandleFunc("/eliminados", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+
+		vals, err := rdb.ZRangeWithScores(ctx, "ts:eliminados", 0, -1).Result()
+		if err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+
+		type DataPoint struct {
+			Time  string `json:"time"`
+			Count int    `json:"count"`
+		}
+
+		var points []DataPoint
+		for _, v := range vals {
+			ts := time.Unix(int64(v.Score), 0)
+			points = append(points, DataPoint{
+				Time:  ts.UTC().Format(time.RFC3339),
+				Count: 1,
+			})
+		}
+
+		json.NewEncoder(w).Encode(points)
+	})
+
+	http.HandleFunc("/top5ram", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+
+		key, err := rdb.Get(ctx, "top5ram:latest").Result()
+		if err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+
+		vals, err := rdb.HGetAll(ctx, key).Result()
+		if err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+
+		type Entry struct {
+			Name  string  `json:"name"`
+			Value float64 `json:"value"`
+		}
+
+		var entries []Entry
+		for _, v := range vals {
+			parts := strings.Split(v, "|")
+			if len(parts) == 3 {
+				val, _ := strconv.ParseFloat(parts[2], 64)
+				entries = append(entries, Entry{
+					Name:  parts[1],
+					Value: val,
+				})
+			}
+		}
+
+		json.NewEncoder(w).Encode(entries)
+	})
+
+	http.HandleFunc("/top5cpu", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+
+		key, err := rdb.Get(ctx, "top5cpu:latest").Result()
+		if err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+
+		vals, err := rdb.HGetAll(ctx, key).Result()
+		if err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+
+		type Entry struct {
+			Name  string  `json:"name"`
+			Value float64 `json:"value"`
+		}
+
+		var entries []Entry
+		for _, v := range vals {
+			parts := strings.Split(v, "|")
+			if len(parts) == 3 {
+				val, _ := strconv.ParseFloat(parts[2], 64)
+				entries = append(entries, Entry{
+					Name:  parts[1],
+					Value: val,
+				})
+			}
+		}
+
+		json.NewEncoder(w).Encode(entries)
+	})
+
+	log.Println("HTTP server iniciado en puerto 8080")
+	go http.ListenAndServe(":8080", nil)
 }
 
 // ─── Shutdown ──────────────────────────────────────────────────────────────────
