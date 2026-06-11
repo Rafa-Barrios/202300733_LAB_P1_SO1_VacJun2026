@@ -192,6 +192,7 @@ func loopPrincipal() {
 	guardarTop5(contenedores)
 
 	log.Println("--- Iteración completada ---")
+	log.Println("")
 }
 
 // ─── Gestión de Contenedores ───────────────────────────────────────────────────
