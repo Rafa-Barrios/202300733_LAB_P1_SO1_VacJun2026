@@ -385,6 +385,11 @@ func guardarMetricasRAM(info ProcInfo) {
 	rdb.Expire(ctx, "ts:usedram", 24*time.Hour)
 	rdb.Expire(ctx, "ts:freeram", 24*time.Hour)
 
+	// Keys directas para los cards de Grafana
+	rdb.Set(ctx, "current:totalram", info.Totalram, 24*time.Hour)
+	rdb.Set(ctx, "current:freeram", info.Freeram, 24*time.Hour)
+	rdb.Set(ctx, "current:usedram", info.Usedram, 24*time.Hour)
+
 	// Guardar referencia al último snapshot
 	rdb.Set(ctx, "ram:latest", key, 24*time.Hour)
 
